@@ -1,0 +1,2 @@
+Coloque aqui as ROMs (bas12.rom/bas13.rom, extbas11.rom, disk11.rom).
+Elas nao sao distribuidas com o projeto.
