@@ -1,0 +1,5 @@
+build/
+roms/*.rom
+roms/*.ROM
+*.o
+*.a
