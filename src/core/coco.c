@@ -253,7 +253,11 @@ static void ff40_write(coco *m, uint8_t v)
 static uint32_t ram_index(coco *m, uint16_t addr)
 {
     uint32_t a = addr;
-    if (a < 0x8000 && sam_page1(&m->sam) && !sam_map_type(&m->sam))
+    /* P1 so troca os 32K inferiores pelos superiores no modo de 64K do
+     * SAM (M=2) com mapa 0.  O Color BASIC deixa P1=1 no modo de 16K,
+     * onde o bit nao tem efeito. */
+    if (a < 0x8000 && sam_page1(&m->sam) && !sam_map_type(&m->sam) &&
+        sam_mem_size(&m->sam) == 2)
         a += 0x8000;
     return a & m->ram_mask;
 }

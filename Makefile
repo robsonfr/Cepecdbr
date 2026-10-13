@@ -3,7 +3,7 @@
 #   make            compila o nucleo, o frontend SDL2 e o headless
 #   make sdl        somente o frontend SDL2  (requer sdl2-config)
 #   make headless   somente o frontend sem interface
-#   make test       compila e roda os testes (CPU, FDC e ROM de teste)
+#   make test       compila e roda os testes (CPU, FDC e maquina com ROM de teste)
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g
@@ -56,11 +56,14 @@ $(BUILD)/test_cpu: $(BUILD)/tests/test_cpu.o $(LIBCORE)
 $(BUILD)/test_fdc: $(BUILD)/tests/test_fdc.o $(LIBCORE)
 	$(CC) $(CFLAGS) $^ -o $@
 
-test: $(BUILD)/test_cpu $(BUILD)/test_fdc headless
+$(BUILD)/test_machine: $(BUILD)/tests/test_machine.o $(LIBCORE)
+	$(CC) $(CFLAGS) $^ -o $@
+
+test: $(BUILD)/test_cpu $(BUILD)/test_fdc $(BUILD)/test_machine
 	$(BUILD)/test_cpu
 	$(BUILD)/test_fdc
 	python3 tests/make_test_rom.py $(BUILD)/testrom.rom
-	$(BUILD)/coco-headless --rom $(BUILD)/testrom.rom --frames 30 --ppm $(BUILD)/testrom.ppm
+	$(BUILD)/test_machine $(BUILD)/testrom.rom
 
 clean:
 	rm -rf $(BUILD)

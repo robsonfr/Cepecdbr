@@ -53,3 +53,13 @@ add_executable(test_fdc tests/test_fdc.c)
 target_include_directories(test_fdc PRIVATE src/core)
 target_link_libraries(test_fdc PRIVATE cococore)
 add_test(NAME fdc COMMAND test_fdc)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND)
+  add_executable(test_machine tests/test_machine.c)
+  target_link_libraries(test_machine PRIVATE cococore)
+  add_test(NAME testrom
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/make_test_rom.py ${CMAKE_BINARY_DIR}/testrom.rom)
+  add_test(NAME machine COMMAND test_machine ${CMAKE_BINARY_DIR}/testrom.rom)
+  set_tests_properties(machine PROPERTIES DEPENDS testrom)
+endif()
