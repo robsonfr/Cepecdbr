@@ -196,6 +196,17 @@ typedef struct coco_cpu_state {
     uint64_t cycles;
 } coco_cpu_state;
 void  coco_get_cpu_state(coco *m, coco_cpu_state *st);
+/* Estado dos perifericos para depuracao. */
+typedef struct coco_io_state {
+    uint16_t sam;                 /* registrador de 16 bits do SAM */
+    uint8_t  vdg_mode;            /* PIA1 PB3-PB7 */
+    uint8_t  pia0_cra, pia0_crb, pia0_ddra, pia0_ddrb, pia0_ora, pia0_orb;
+    uint8_t  pia1_cra, pia1_crb, pia1_ddra, pia1_ddrb, pia1_ora, pia1_orb;
+    uint8_t  ff40;                /* latch do controlador de disco */
+    uint8_t  fdc_status, fdc_track, fdc_sector, fdc_command;
+    int      irq, firq, nmi, halted;
+} coco_io_state;
+void  coco_get_io_state(coco *m, coco_io_state *st);
 
 #ifdef __cplusplus
 }

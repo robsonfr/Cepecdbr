@@ -666,3 +666,24 @@ void coco_get_cpu_state(coco *m, coco_cpu_state *st)
     st->pc = m->cpu.pc;
     st->cycles = m->cpu.cycles;
 }
+
+void coco_get_io_state(coco *m, coco_io_state *st)
+{
+    st->sam = m->sam.reg;
+    st->vdg_mode = m->vdg_mode;
+    st->pia0_cra = m->pia0.a.cr;  st->pia0_crb = m->pia0.b.cr;
+    st->pia0_ddra = m->pia0.a.ddr; st->pia0_ddrb = m->pia0.b.ddr;
+    st->pia0_ora = m->pia0.a.out; st->pia0_orb = m->pia0.b.out;
+    st->pia1_cra = m->pia1.a.cr;  st->pia1_crb = m->pia1.b.cr;
+    st->pia1_ddra = m->pia1.a.ddr; st->pia1_ddrb = m->pia1.b.ddr;
+    st->pia1_ora = m->pia1.a.out; st->pia1_orb = m->pia1.b.out;
+    st->ff40 = m->ff40;
+    st->fdc_status = m->fdc.status;
+    st->fdc_track = m->fdc.track;
+    st->fdc_sector = m->fdc.sector;
+    st->fdc_command = m->fdc.command;
+    st->irq = m->cpu.irq_line;
+    st->firq = m->cpu.firq_line;
+    st->nmi = m->cpu.nmi_line;
+    st->halted = m->disk_enabled && m->halt_enable && !m->fdc.drq;
+}
