@@ -244,3 +244,17 @@ rotinas pelas suas.
 - Fitas em WAV, RS-232/impressora e Orchestra-90 não emulados
 - Temporização do SAM aproximada: o modo de velocidade dependente do endereço (R0=1) roda em velocidade normal
 - Artefato NTSC simplificado (pares de pixels)
+
+## Licença
+
+Distribuído sob a [licença MIT](LICENSE). Você pode usar, modificar e
+redistribuir o código, inclusive embarcado em jogos comerciais, desde que
+mantenha o aviso de copyright e a licença junto com o software. No jogo
+embarcado, isso pode ir num arquivo de texto ao lado do executável ou numa
+tela de créditos.
+
+A licença cobre apenas o código deste repositório:
+
+- **ROMs da Tandy/Microsoft**: não fazem parte do projeto nem são cobertas por esta licença.
+- **SDL2**: usa a licença zlib, compatível com a MIT; ao distribuir a `SDL2.dll`, nada mais é exigido.
+- **Seus jogos**: o binário embarcado é seu e pode ter a licença que você quiser.
