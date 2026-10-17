@@ -9,6 +9,10 @@
  *                    [--rom arquivo] (ROM de 8K em $A000, ignora --rom-dir)
  *                    [--wav saida.raw] (audio PCM 16 bits mono 44100 Hz)
  *                    [--no-ext] [--no-disk]
+ *                    [--cart arquivo] (cartucho em $C000)
+ *                    [--no-rom]  (sem ROMs: RESET salta para o cartucho)
+ *                    [--load-state arq] (restaura snapshot apos o reset)
+ *                    [--save-state arq] (grava snapshot ao final)
  *                    [--diag]  (relatorio para depuracao: onde a CPU passa o
  *                               tempo, registradores, perifericos, RAM baixa)
  */
@@ -166,6 +170,8 @@ int main(int argc, char **argv)
     coco *m;
     const char *rom_dir = "roms", *rom = NULL, *ppm = NULL, *type = NULL;
     const char *cas = NULL, *wav = NULL;
+    const char *cart = NULL, *load_state = NULL, *save_state = NULL;
+    int no_rom = 0;
     const char *disks[MEDIA_MAX_DRIVES] = { NULL, NULL, NULL, NULL };
     int frames = 300, i, boot_frames = 120;
     int want_ext = 1, want_disk = 1, diag = 0, nsamples = 0;
@@ -185,6 +191,7 @@ int main(int argc, char **argv)
         if (!strcmp(o, "--no-ext"))       { want_ext = 0; continue; }
         if (!strcmp(o, "--no-disk"))      { want_disk = 0; continue; }
         if (!strcmp(o, "--diag"))         { diag = 1; continue; }
+        if (!strcmp(o, "--no-rom"))       { no_rom = 1; continue; }
         if (!v) { fprintf(stderr, "faltou argumento para %s\n", o); return 1; }
         if (!strcmp(o, "--rom-dir"))      { rom_dir = v; i++; }
         else if (!strcmp(o, "--rom"))     { rom = v; i++; }
@@ -194,6 +201,9 @@ int main(int argc, char **argv)
         else if (!strcmp(o, "--ppm"))     { ppm = v; i++; }
         else if (!strcmp(o, "--cas"))     { cas = v; i++; }
         else if (!strcmp(o, "--wav"))     { wav = v; i++; }
+        else if (!strcmp(o, "--cart"))    { cart = v; i++; }
+        else if (!strcmp(o, "--load-state")) { load_state = v; i++; }
+        else if (!strcmp(o, "--save-state")) { save_state = v; i++; }
         else if (!strcmp(o, "--model"))   { cfg.model = atoi(v) == 1 ? COCO_MODEL_1 : COCO_MODEL_2; i++; }
         else if (!strcmp(o, "--ram"))     { cfg.ram_kb = atoi(v); i++; }
         else if (o[0] == '-' && o[1] >= '0' && o[1] <= '3' && !o[2]) { disks[o[1] - '0'] = v; i++; }
@@ -207,7 +217,10 @@ int main(int argc, char **argv)
     if (wav) hl.audio_out = fopen(wav, "wb");
 
     m = coco_create(&cfg, &host);
-    if (rom) {
+    if (no_rom) {
+        if (!cart) { fprintf(stderr, "--no-rom exige --cart\n"); return 1; }
+        coco_load_boot_stub(m, 0xc000);
+    } else if (rom) {
         size_t size;
         uint8_t *data = media_read_file(rom, &size);
         if (!data) { fprintf(stderr, "nao foi possivel ler %s\n", rom); return 1; }
@@ -217,10 +230,28 @@ int main(int argc, char **argv)
         fprintf(stderr, "ROM do Color BASIC nao encontrada em %s\n", rom_dir);
         return 1;
     }
+    if (cart) {
+        size_t size;
+        uint8_t *data = media_read_file(cart, &size);
+        if (!data) { fprintf(stderr, "nao foi possivel ler %s\n", cart); return 1; }
+        coco_load_rom(m, COCO_ROM_CARTRIDGE, data, size);
+        coco_set_cartridge_autostart(m, !no_rom);
+        free(data);
+    }
     for (i = 0; i < MEDIA_MAX_DRIVES; i++)
         if (disks[i]) media_disk_insert(&md, i, disks[i], 0);
     if (cas) media_tape_insert(&md, cas);
     coco_reset(m, 1);
+    if (load_state) {
+        size_t size;
+        uint8_t *data = media_read_file(load_state, &size);
+        int r = data ? coco_snapshot_load(m, data, size) : -1;
+        free(data);
+        if (r != COCO_SNAPSHOT_OK) {
+            fprintf(stderr, "falha ao carregar %s (codigo %d)\n", load_state, r);
+            return 1;
+        }
+    }
 
     for (i = 0; i < boot_frames && i < frames; i++) {
         coco_run_frame(m);
@@ -257,6 +288,15 @@ int main(int argc, char **argv)
 
     if (diag)
         diag_report(m, samples, nsamples);
+
+    if (save_state) {
+        size_t size = coco_snapshot_size(m);
+        uint8_t *data = (uint8_t *)malloc(size);
+        if (!data || !coco_snapshot_save(m, data, size) ||
+            media_write_file(save_state, data, size) != 0)
+            fprintf(stderr, "falha ao gravar %s\n", save_state);
+        free(data);
+    }
 
     if (ppm && save_ppm(ppm, hl.last) != 0)
         fprintf(stderr, "falha ao gravar %s\n", ppm);

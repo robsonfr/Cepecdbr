@@ -5,9 +5,10 @@ Emulador do **TRS-80 Color Computer 1 e 2** (CoCo 1/2) escrito 100% em C99.
 O **núcleo** (`src/core`) não sabe nada sobre gráficos, som, arquivos ou
 sistema operacional. Ele se comunica com o mundo externo só pela
 estrutura de callbacks `coco_host` (`include/coco.h`). Os **frontends**
-implementam essa interface. Este repositório traz dois:
+implementam essa interface. Este repositório traz três:
 
-- `frontend/sdl`: frontend completo com **SDL2** (janela, áudio, teclado, joystick/mouse)
+- `frontend/sdl`: o emulador completo com **SDL2** (janela, áudio, teclado, joystick/mouse, snapshots)
+- `frontend/game`: um executável que já traz um jogo embutido e roda **sem as ROMs da Tandy**
 - `frontend/headless`: sem interface, roda N quadros e salva a tela em PPM (usado nos testes)
 
 ## Arquitetura
@@ -23,9 +24,14 @@ src/core/
   cassette.[ch]             Fita: leitura de .CAS (gera a onda de 1200/2400 Hz) e gravação
   coco.c                    Barramento, mapa de memória, temporização de vídeo, áudio, glue
 frontend/common/media.[ch]  ROMs, imagens JVC/DSK e fitas .CAS via stdio (sem SDL)
-frontend/sdl/main.c         Frontend SDL2
+frontend/sdl/sdl_app.[ch]   Camada SDL2 comum (janela, áudio, teclado, laço, snapshots)
+frontend/sdl/main.c         Emulador SDL2 (linha de comando, ROMs, mídias)
+frontend/game/main.c        Jogo embarcado: emulador + binário do jogo num só executável
 frontend/headless/main.c    Frontend sem interface
-tests/                      Testes da CPU, do FDC e uma ROM de teste gerada por script
+examples/game/game.asm      Jogo-exemplo em assembly 6809 que não usa ROM
+tools/asm6809.py            Assembler 6809 mínimo (sintaxe do lwasm) usado no build
+tools/bin2c.c               Converte o binário do jogo em fonte C
+tests/                      Testes da CPU, do FDC, da máquina, do jogo e dos snapshots
 ```
 
 ### Interface com o hospedeiro
@@ -72,9 +78,11 @@ Requisitos: compilador C99. Para o frontend gráfico, SDL2 (`libsdl2-dev` no Deb
 `brew install sdl2` no macOS).
 
 ```sh
-make            # build/coco-sdl e build/coco-headless
-make test       # testes da CPU, do FDC e da ROM de teste
+make            # build/coco-sdl, build/coco-headless e build/coleta (jogo-exemplo)
+make test       # testes da CPU, do FDC, da máquina, do jogo e dos snapshots
 ```
+
+O jogo-exemplo é montado por `tools/asm6809.py`, então o build dele precisa de Python 3.
 
 Também dá para usar CMake (inclusive no Windows):
 
@@ -104,6 +112,8 @@ em `./roms` (ou indique outro lugar com `--rom-dir`):
 ./build/coco-sdl --cas-out saida.cas     # CSAVE grava em saida.cas
 ./build/coco-sdl --cart jogo.rom         # cartucho com autostart
 ./build/coco-sdl --artifact 1            # cores de artefato em PMODE 4
+./build/coco-sdl --no-rom --cart jogo.bin  # sem ROMs: o RESET salta direto para o cartucho
+./build/coco-sdl --snapshot partida.snap # arquivo usado por F2/F3 (padrão coco.snap)
 ```
 
 | Tecla do PC       | Função                             |
@@ -111,6 +121,7 @@ em `./roms` (ou indique outro lugar com `--rom-dir`):
 | Esc / End         | BREAK                              |
 | Home / Delete     | CLEAR                              |
 | Backspace         | seta para a esquerda               |
+| F2 / F3           | salva / carrega o estado (snapshot)|
 | F8                | alterna as cores de artefato       |
 | F9                | rebobina a fita                    |
 | F10               | turbo (sem limite de velocidade)   |
@@ -121,6 +132,98 @@ Os símbolos seguem o layout US do PC e são traduzidos para o layout do CoCo
 (por exemplo, `"` no PC vira SHIFT+2 no CoCo e `=` vira SHIFT+`-`). Um
 controle (gamepad) vira o joystick direito, e um segundo controle, o esquerdo.
 Com `--mouse`, o mouse faz o papel do joystick direito.
+
+## Snapshots (salvar e carregar estado)
+
+Um snapshot guarda o estado completo da máquina: a RAM inteira, os
+registradores da CPU, PIAs, SAM, VDG, o controlador de disco e a interface
+de fita. Ao carregar, a execução continua exatamente do ponto salvo. Só a
+RAM não bastaria, porque sem os registradores e os chips o programa não
+retoma.
+
+As ROMs e as mídias (arquivos de disco e fita) **não** entram no snapshot.
+Antes de carregar, o frontend precisa ter carregado as mesmas ROMs; um hash
+gravado no arquivo confere isso e recusa snapshots de outra configuração
+ou de outra versão do jogo. O formato é binário e portátil
+(little-endian, campo a campo, com cerca de 72 KB numa máquina de 64K), então
+um arquivo salvo no Windows abre no Linux.
+
+```c
+size_t n = coco_snapshot_size(m);
+uint8_t *buf = malloc(n);
+coco_snapshot_save(m, buf, n);            /* grave buf onde quiser */
+...
+int r = coco_snapshot_load(m, buf, n);    /* COCO_SNAPSHOT_OK ou erro */
+```
+
+O núcleo só trabalha com buffers. Quem decide onde gravar é o frontend: o
+emulador SDL usa `--snapshot ARQ` (padrão `coco.snap`), o jogo embarcado usa
+a pasta de preferências do usuário (no Windows, `%APPDATA%\Cepecdbr\<jogo>\`)
+e o headless tem `--save-state` e `--load-state`.
+
+## Jogos embarcados (sem ROMs)
+
+O emulador reproduz o hardware, e o BASIC é só um programa em ROM. Um jogo
+que inicializa o hardware por conta própria roda sem nenhuma ROM da Tandy,
+e o binário dele pode ir dentro do executável.
+
+### Como funciona
+
+- O jogo fica no espaço de cartucho (`$C000-$FEFF`, até 16.128 bytes) e começa em `$C000`.
+- `coco_load_boot_stub(m, 0xC000)` instala no lugar do BASIC uma "ROM" que
+  só tem os vetores: o RESET salta para `$C000`, e IRQ/FIRQ/NMI/SWI apontam
+  para a RAM em `$0100-$010F` (IRQ em `$010C`, FIRQ em `$010F`), os mesmos
+  endereços que o BASIC usa.
+- O jogo grava `JMP rotina` nesses endereços antes de liberar as interrupções.
+  Assim, **o mesmo binário funciona como cartucho num CoCo real**: lá, o
+  BASIC dá a partida e salta para `$C000`.
+
+### O jogo-exemplo
+
+`examples/game/game.asm` (cerca de 300 linhas) é um jogo de coletar alvos
+que mostra tudo o que normalmente viria do BASIC:
+
+- inicialização do SAM e das PIAs;
+- interrupção de quadro (60 Hz) com vetor em RAM;
+- varredura do teclado;
+- texto e semigráficos escritos direto na tela;
+- som pelo DAC.
+
+```sh
+make game                                # gera build/coleta (o jogo-exemplo)
+./build/coleta                           # roda sem nenhum arquivo de ROM
+```
+
+No jogo, F2/F3 salvam e carregam, F11 alterna a tela cheia e F12 reinicia.
+Com `--dev`, as teclas F8-F10 de desenvolvimento também ficam ativas.
+
+### Usando o seu jogo
+
+```sh
+# fonte no formato do lwasm, montado pelo assembler incluído:
+make game GAME_ASM=meujogo.asm GAME_TITLE="Meu Jogo" GAME_NAME=meujogo
+
+# ou um binário já montado (ex.: lwasm --raw -o meujogo.bin meujogo.asm):
+make game GAME_BIN=meujogo.bin GAME_TITLE="Meu Jogo" GAME_NAME=meujogo
+```
+
+O resultado é `build/meujogo` (ou `meujogo.exe` no Windows): um único
+executável (mais a `SDL2.dll` no Windows). Durante o desenvolvimento, dá
+para testar sem recompilar o frontend:
+
+```sh
+./build/coco-sdl --no-rom --cart meujogo.bin
+```
+
+No CMake, as mesmas opções existem como variáveis de cache (`-DGAME_BIN=...`,
+`-DGAME_TITLE=...`, `-DGAME_NAME=...`).
+
+O `tools/asm6809.py` é um assembler mínimo, feito para o exemplo montar sem
+dependências externas. Para projetos maiores, use o
+[LWTOOLS](http://www.lwtools.ca/) (`lwasm`) e passe o binário em `GAME_BIN`. Em C,
+o compilador CMOC também gera código 6809, mas a biblioteca padrão dele usa
+rotinas do BASIC (o `printf`, por exemplo): sem ROM, é preciso trocar essas
+rotinas pelas suas.
 
 ## O que está emulado
 

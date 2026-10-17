@@ -691,3 +691,233 @@ void coco_get_io_state(coco *m, coco_io_state *st)
     st->nmi = m->cpu.nmi_line;
     st->halted = m->disk_enabled && m->halt_enable && !m->fdc.drq;
 }
+
+/* ------------------------------------------------------------------------ */
+/* Stub de boot (execucao sem as ROMs da Tandy)                             */
+/* ------------------------------------------------------------------------ */
+
+void coco_load_boot_stub(coco *m, uint16_t entry)
+{
+    /* vetores $FFF2-$FFFF, lidos de $BFF2-$BFFF */
+    static const uint16_t ram_vectors[6] = {
+        0x0100,     /* SWI3 */
+        0x0103,     /* SWI2 */
+        0x010f,     /* FIRQ */
+        0x010c,     /* IRQ  */
+        0x0106,     /* SWI  */
+        0x0109      /* NMI  */
+    };
+    int i;
+    memset(m->rom_basic, 0xff, sizeof(m->rom_basic));
+    for (i = 0; i < 6; i++) {
+        m->rom_basic[0x1ff2 + 2 * i] = (uint8_t)(ram_vectors[i] >> 8);
+        m->rom_basic[0x1ff3 + 2 * i] = (uint8_t)ram_vectors[i];
+    }
+    m->rom_basic[0x1ffe] = (uint8_t)(entry >> 8);
+    m->rom_basic[0x1fff] = (uint8_t)entry;
+    m->has_basic = 1;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Snapshots                                                                */
+/* ------------------------------------------------------------------------ */
+
+#define SNAP_MAGIC    "COCOSNAP"
+#define SNAP_VERSION  1
+#define SNAP_HEADER   (8 + 2 + 1 + 2 + 4)
+
+typedef struct snapbuf {
+    uint8_t       *w;       /* escrita (NULL ao ler/medir) */
+    const uint8_t *r;       /* leitura */
+    size_t         pos;
+} snapbuf;
+
+/* Cada campo e serializado por uma unica funcao "sync" usada nos dois
+ * sentidos, o que garante que gravacao e leitura nunca divirjam. */
+static void s_bytes(snapbuf *b, void *p, size_t n)
+{
+    if (b->w)      memcpy(b->w + b->pos, p, n);
+    else if (b->r) memcpy(p, b->r + b->pos, n);
+    b->pos += n;
+}
+
+static void s_u8(snapbuf *b, uint8_t *v)
+{
+    s_bytes(b, v, 1);
+}
+
+static void s_u16(snapbuf *b, uint16_t *v)
+{
+    uint8_t t[2];
+    t[0] = (uint8_t)*v; t[1] = (uint8_t)(*v >> 8);
+    s_bytes(b, t, 2);
+    *v = (uint16_t)(t[0] | (t[1] << 8));
+}
+
+static void s_u32(snapbuf *b, uint32_t *v)
+{
+    uint8_t t[4];
+    int i;
+    for (i = 0; i < 4; i++) t[i] = (uint8_t)(*v >> (8 * i));
+    s_bytes(b, t, 4);
+    *v = 0;
+    for (i = 0; i < 4; i++) *v |= (uint32_t)t[i] << (8 * i);
+}
+
+static void s_u64(snapbuf *b, uint64_t *v)
+{
+    uint8_t t[8];
+    int i;
+    for (i = 0; i < 8; i++) t[i] = (uint8_t)(*v >> (8 * i));
+    s_bytes(b, t, 8);
+    *v = 0;
+    for (i = 0; i < 8; i++) *v |= (uint64_t)t[i] << (8 * i);
+}
+
+static void s_int(snapbuf *b, int *v)
+{
+    uint32_t t = (uint32_t)*v;
+    s_u32(b, &t);
+    *v = (int)(int32_t)t;
+}
+
+static void s_pia_port(snapbuf *b, mc6821_port *p)
+{
+    s_u8(b, &p->out);
+    s_u8(b, &p->ddr);
+    s_u8(b, &p->cr);
+    s_u8(b, &p->in);
+    s_int(b, &p->c1);
+    s_int(b, &p->c2);
+    s_int(b, &p->irq1);
+    s_int(b, &p->irq2);
+    s_int(b, &p->c2_out);
+}
+
+static void snapshot_sync(coco *m, snapbuf *b)
+{
+    mc6809 *c = &m->cpu;
+    wd1793 *f = &m->fdc;
+    cassette *t = &m->cas;
+    int i;
+
+    /* CPU */
+    s_u8(b, &c->a);  s_u8(b, &c->b);  s_u8(b, &c->dp); s_u8(b, &c->cc);
+    s_u16(b, &c->x); s_u16(b, &c->y); s_u16(b, &c->u); s_u16(b, &c->s);
+    s_u16(b, &c->pc);
+    s_int(b, &c->nmi_line);  s_int(b, &c->nmi_latched); s_int(b, &c->nmi_armed);
+    s_int(b, &c->firq_line); s_int(b, &c->irq_line);
+    s_int(b, &c->cwai);      s_int(b, &c->sync);
+    s_u64(b, &c->cycles);
+
+    /* PIAs, SAM, VDG */
+    s_pia_port(b, &m->pia0.a); s_pia_port(b, &m->pia0.b);
+    s_pia_port(b, &m->pia1.a); s_pia_port(b, &m->pia1.b);
+    s_u16(b, &m->sam.reg);
+    s_u8(b, &m->vdg_mode);
+
+    /* glue */
+    s_u8(b, &m->ff40);
+    s_int(b, &m->halt_enable);
+    s_int(b, &m->tick_budget);
+    s_int(b, &m->cart_q);
+
+    /* controlador de disco */
+    s_u8(b, &f->status); s_u8(b, &f->track); s_u8(b, &f->sector);
+    s_u8(b, &f->data);   s_u8(b, &f->command);
+    s_int(b, &f->drive); s_int(b, &f->side); s_int(b, &f->dden);
+    for (i = 0; i < WD_MAX_DRIVES; i++) s_int(b, &f->head_pos[i]);
+    s_int(b, &f->step_dir);
+    s_int(b, &f->intrq); s_int(b, &f->drq);
+    s_int(b, &f->cmd_type); s_int(b, &f->state); s_int(b, &f->delay);
+    s_int(b, &f->pos); s_int(b, &f->len);
+    s_u64(b, &f->time);
+    s_bytes(b, f->buf, sizeof(f->buf));
+
+    /* fita (a posicao no arquivo pertence ao hospedeiro) */
+    s_int(b, &t->motor); s_u64(b, &t->time);
+    s_int(b, &t->eof); s_int(b, &t->byte); s_int(b, &t->bit_index);
+    s_int(b, &t->half); s_int(b, &t->remaining); s_int(b, &t->level);
+    s_int(b, &t->half_ticks);
+    s_int(b, &t->out_high); s_u64(b, &t->out_rise_time);
+    s_u8(b, &t->wbyte); s_int(b, &t->wbits);
+
+    /* RAM */
+    s_bytes(b, m->ram, (size_t)m->cfg.ram_kb * 1024);
+}
+
+/* FNV-1a sobre as ROMs carregadas: detecta snapshot de outra configuracao. */
+static uint32_t rom_hash(coco *m)
+{
+    uint32_t h = 2166136261u;
+    size_t i;
+    for (i = 0; i < sizeof(m->rom_basic); i++) h = (h ^ m->rom_basic[i]) * 16777619u;
+    if (m->has_ext)
+        for (i = 0; i < sizeof(m->rom_ext); i++) h = (h ^ m->rom_ext[i]) * 16777619u;
+    for (i = 0; i < m->cart_size; i++) h = (h ^ m->rom_cart[i]) * 16777619u;
+    return h;
+}
+
+size_t coco_snapshot_size(coco *m)
+{
+    snapbuf b;
+    b.w = NULL; b.r = NULL; b.pos = 0;
+    snapshot_sync(m, &b);       /* so mede: nao le nem grava */
+    return SNAP_HEADER + b.pos;
+}
+
+size_t coco_snapshot_save(coco *m, uint8_t *buf, size_t cap)
+{
+    size_t size = coco_snapshot_size(m);
+    snapbuf b;
+    uint16_t ver = SNAP_VERSION, ram = (uint16_t)m->cfg.ram_kb;
+    uint8_t model = (uint8_t)m->cfg.model;
+    uint32_t hash = rom_hash(m);
+
+    if (!buf || cap < size)
+        return 0;
+    b.w = buf; b.r = NULL; b.pos = 0;
+    s_bytes(&b, (void *)SNAP_MAGIC, 8);
+    s_u16(&b, &ver);
+    s_u8(&b, &model);
+    s_u16(&b, &ram);
+    s_u32(&b, &hash);
+    snapshot_sync(m, &b);
+    return b.pos;
+}
+
+int coco_snapshot_load(coco *m, const uint8_t *buf, size_t size)
+{
+    snapbuf b;
+    char magic[8];
+    uint16_t ver = 0, ram = 0;
+    uint8_t model = 0;
+    uint32_t hash = 0;
+
+    if (!buf || size < SNAP_HEADER)
+        return COCO_SNAPSHOT_ERR_SIZE;
+    b.w = NULL; b.r = buf; b.pos = 0;
+    s_bytes(&b, magic, 8);
+    s_u16(&b, &ver);
+    s_u8(&b, &model);
+    s_u16(&b, &ram);
+    s_u32(&b, &hash);
+    if (memcmp(magic, SNAP_MAGIC, 8) != 0 || ver != SNAP_VERSION)
+        return COCO_SNAPSHOT_ERR_FORMAT;
+    if (ram != m->cfg.ram_kb)
+        return COCO_SNAPSHOT_ERR_RAM;
+    if (hash != rom_hash(m))
+        return COCO_SNAPSHOT_ERR_ROM;
+    if (size < coco_snapshot_size(m))
+        return COCO_SNAPSHOT_ERR_SIZE;
+    (void)model;
+
+    /* todas as verificacoes passaram: a leitura abaixo nao falha */
+    snapshot_sync(m, &b);
+
+    /* estado derivado que nao vai no arquivo */
+    m->alen = 0;
+    m->a_sum = 0;
+    m->a_cnt = 0;
+    return COCO_SNAPSHOT_OK;
+}

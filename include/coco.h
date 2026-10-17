@@ -159,6 +159,14 @@ void  coco_eject_cartridge(coco *m);
 void  coco_enable_disk_controller(coco *m, int enable);
 /* Se verdadeiro, o cartucho dispara o sinal CART (autostart). */
 void  coco_set_cartridge_autostart(coco *m, int enable);
+/* Instala no slot do Color BASIC uma "ROM" minima que contem apenas os
+ * vetores de interrupcao: RESET salta para 'entry' (ex.: $C000) e os demais
+ * vetores apontam para a RAM ($0100-$010F), exatamente como no BASIC
+ * (SWI3 $0100, SWI2 $0103, SWI $0106, NMI $0109, IRQ $010C, FIRQ $010F).
+ * Permite rodar um programa proprio (cartucho) sem as ROMs da Tandy.
+ * O programa deve gravar "JMP rotina" nesses enderecos antes de habilitar
+ * as interrupcoes; o mesmo binario funciona como cartucho num CoCo real. */
+void  coco_load_boot_stub(coco *m, uint16_t entry);
 
 /* reset "quente" (botao RESET) ou "frio" (desliga/liga, limpa a RAM).
  * Chame coco_reset(m, 1) depois de carregar as ROMs. */
@@ -175,6 +183,33 @@ void  coco_key_set(coco *m, int key, int pressed);
 void  coco_keys_clear(coco *m);
 /* joy: 0 = direito, 1 = esquerdo. Eixos 0..63. */
 void  coco_joystick_set(coco *m, int joy, int x, int y, int button);
+
+/* ------------------------------------------------------------------------ */
+/* Snapshots (salvar/carregar o estado da maquina)                          */
+/* ------------------------------------------------------------------------ */
+
+/* Um snapshot guarda o estado completo necessario para continuar a execucao
+ * exatamente do ponto salvo: RAM inteira, registradores da CPU, PIAs, SAM,
+ * VDG, controlador de disco e interface de fita.  ROMs e midias (arquivos
+ * de disco/fita) NAO sao incluidas: o hospedeiro deve carregar as mesmas
+ * ROMs antes de restaurar (o snapshot guarda um hash para conferir).
+ * O formato e binario, portatil (little-endian, campo a campo) e
+ * independente de compilador/arquitetura. */
+
+#define COCO_SNAPSHOT_OK           0
+#define COCO_SNAPSHOT_ERR_FORMAT  (-1)   /* nao e snapshot / versao desconhecida */
+#define COCO_SNAPSHOT_ERR_SIZE    (-2)   /* buffer truncado */
+#define COCO_SNAPSHOT_ERR_RAM     (-3)   /* tamanho de RAM diferente */
+#define COCO_SNAPSHOT_ERR_ROM     (-4)   /* ROMs diferentes das usadas ao salvar */
+
+/* Tamanho em bytes do snapshot desta maquina. */
+size_t coco_snapshot_size(coco *m);
+/* Grava o snapshot em 'buf' (capacidade 'cap'). Retorna os bytes escritos
+ * ou 0 se o buffer for pequeno demais. */
+size_t coco_snapshot_save(coco *m, uint8_t *buf, size_t cap);
+/* Restaura o snapshot. Retorna COCO_SNAPSHOT_OK ou um codigo de erro; em
+ * caso de erro o estado da maquina nao e alterado. */
+int    coco_snapshot_load(coco *m, const uint8_t *buf, size_t size);
 
 /* ------------------------------------------------------------------------ */
 /* Utilitarios                                                              */

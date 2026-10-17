@@ -39,6 +39,8 @@ typedef struct media {
 
 /* Le um arquivo inteiro para a memoria. Retorna NULL em erro. */
 uint8_t *media_read_file(const char *path, size_t *size);
+/* Grava 'size' bytes em 'path' (substitui o arquivo). Retorna 0 em sucesso. */
+int      media_write_file(const char *path, const uint8_t *data, size_t size);
 
 /* Procura ROMs em 'dir' com os nomes usuais e carrega na maquina.
  * Retorna bitmask: 1 = Color BASIC, 2 = Extended BASIC, 4 = Disk BASIC. */
