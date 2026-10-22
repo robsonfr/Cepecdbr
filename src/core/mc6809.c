@@ -734,10 +734,13 @@ int mc6809_step(mc6809 *cpu)
                 break;
             }
             case 0xf: {                                     /* STX/STU */
-                uint16_t ea, v = isb ? cpu->u : cpu->x;
+                uint16_t ea, v;
                 if (mode == 0) { cyc = 2; break; }
                 cyc = (mode == 3) ? 6 : 5;
                 ea = ea_mode(cpu, mode, &cyc);
+                /* lido depois do calculo do endereco: STX ,X++ grava o X
+                 * ja incrementado, como no 6809 real */
+                v = isb ? cpu->u : cpu->x;
                 wr16(cpu, ea, v);
                 ld_flags16(cpu, v);
                 break;
@@ -837,9 +840,10 @@ static int exec_page2(mc6809 *cpu)
     case 0x9f: case 0xaf: case 0xbf:                /* STY */
     case 0xdf: case 0xef: case 0xff: {              /* STS */
         int mode = (op >> 4) & 3;
-        uint16_t ea, v = (op & 0x40) ? cpu->s : cpu->y;
+        uint16_t ea, v;
         cyc = (mode == 3) ? 7 : 6;
         ea = ea_mode(cpu, mode, &cyc);
+        v = (op & 0x40) ? cpu->s : cpu->y;   /* depois do endereco (ver STX) */
         wr16(cpu, ea, v);
         ld_flags16(cpu, v);
         return cyc;
