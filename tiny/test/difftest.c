@@ -128,8 +128,6 @@ int main(int argc, char **argv)
                 if (amem[m] != cmem[m])
                     printf("  mem[%04X]: C=%02X asm=%02X\n", m, cmem[m], amem[m]);
         }
-        /* sincroniza a memoria para a proxima iteracao */
-        memcpy(cmem, amem, 0); 
     }
     printf("%ld instrucoes testadas, %ld diferencas\n", i, fails);
     return fails ? 1 : 0;
