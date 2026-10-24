@@ -1,7 +1,7 @@
 # coco4k: emulador de CoCo 1/2 em um executável de 4 KB
 
 Este diretório tem uma versão do emulador escrita em **assembly x86 de 32 bits**
-que gera um executável Windows de **4036 bytes**. É um experimento separado do
+que gera um executável Windows de **3892 bytes**. É um experimento separado do
 emulador principal em C (que continua sendo a referência): o objetivo aqui é
 tamanho mínimo, não fidelidade máxima.
 
@@ -9,7 +9,8 @@ tamanho mínimo, não fidelidade máxima.
 
 | Item | Situação |
 |---|---|
-| Tamanho do `coco4k.exe` | **4036 bytes** (limite: 4096; o `make` falha se passar) |
+| Tamanho do `coco4k.exe` | **3892 bytes** (limite: 4096; o `make` falha se passar) |
+| Variantes de segurança | cabeçalho PE convencional: 4080 bytes; tabela de importação convencional: 4032 bytes; as duas cabem em 4 KB |
 | CPU 6809 | todas as instruções documentadas; **zero diferenças** contra a CPU em C em milhões de instruções aleatórias |
 | Vídeo | texto, semigráficos SG4 e os 8 modos gráficos (PMODE), CSS 0/1: **tela idêntica pixel a pixel** ao emulador em C |
 | Teclado, IRQ de quadro (TIMER) | idênticos ao emulador em C no jogo-exemplo |
@@ -31,9 +32,20 @@ tamanho mínimo, não fidelidade máxima.
   memória têm o mesmo layout, sem preenchimento até 512 bytes. É um recurso
   previsto na especificação PE.
 - **Cabeçalho compacto:** o cabeçalho PE começa no offset 4, sobreposto ao MZ.
-  O campo `e_lfanew` coincide com o `SectionAlignment`, que vale 4. Só 2
-  diretórios de dados são declarados. Economiza 172 bytes;
-  `make safe` gera a variante convencional (4208 bytes) como plano B.
+  O campo `e_lfanew` coincide com o `SectionAlignment`, que vale 4. Nenhum
+  diretório de dados é declarado. `make safe` gera a variante convencional
+  (4080 bytes) como plano B.
+- **Funções do Windows carregadas por hash, sem tabela de importação:**
+  1. a `kernel32` é localizada percorrendo a lista de módulos da PEB
+     (`fs:[30h]`), comparando o hash do nome de cada módulo;
+  2. cada função é procurada pelo hash do nome na tabela de exportação;
+  3. `user32` e `gdi32` são carregadas com `LoadLibraryA`.
+
+  O hash é `h = ror(h,13) + (c | 20h)`, calculado pelo próprio pré-processador
+  do NASM a partir dos nomes (`IMPORT Sleep`), então não há arquivo gerado.
+  As chamadas viram `call [ebp+deslocamento]`, com 3 bytes em vez de 6.
+  Comparado à tabela convencional, economiza 140 bytes; `make static`
+  gera a variante convencional (4032 bytes) como plano C.
 - **Sem memória estática:** os 64 KB do 6809, o estado e a tela (≈130 KB) ficam
   na pilha, que o cabeçalho pede comprometida (4 MB). Não há seção de dados nem
   `VirtualAlloc`.
@@ -101,12 +113,11 @@ com o emulador em C, que já roda o BASIC real:
 ### 5. Próximos passos
 
 1. **Testar no Windows 11 real e com as ROMs do BASIC.** É o risco principal (veja abaixo).
-2. **Importar funções por hash.** Hoje a tabela de importação ocupa 339 bytes,
-   quase 9% do arquivo. O caminho é localizar o kernel32 pelo PEB, procurar as
-   funções por hash na tabela de exportação e usar `LoadLibraryA` para user32 e
-   gdi32. É a técnica das intros de 4K e deve liberar ~200 bytes. Com isso:
-   - a variante de cabeçalho convencional também cabe em 4 KB;
-   - sobra espaço para os itens 3 e 4.
+2. **Importar funções por hash** — **feito.** Liberou 140 bytes, e as variantes
+   de segurança também passaram a caber em 4 KB. Sobram 204 bytes para os
+   próximos itens. Dá para ganhar mais ~30 bytes encolhendo o carregador:
+   assumir a kernel32 como 3º módulo em vez de comparar nomes, e
+   compartilhar o laço de hash.
 3. **Som:** amostrar o DAC uma vez por linha (≈15,7 kHz) e tocar com `waveOut*`
    (winmm). Estimativa: 150 a 200 bytes.
 4. **Joystick pelo mouse** (comparador com o DAC): cerca de 40 bytes.
@@ -120,11 +131,19 @@ com o emulador em C, que já roda o BASIC real:
 - **Carregador do Windows:** o cabeçalho sobreposto e o alinhamento de 4 bytes
   seguem a especificação PE e são usados por executáveis mínimos no Windows
   10/11. Mas só foram testados no Wine, que é mais tolerante. Se o Windows
-  recusar: primeiro `make safe` (cabeçalho convencional, hoje 4208 bytes);
-   depois, o passo 2 acima, para que ele volte a caber em 4 KB.
+  recusar, use `make safe` (cabeçalho convencional, 4080 bytes).
+- **Funções por hash:** confirmei no Wine que nenhuma das 13 funções colide com
+  outro nome nem é encaminhada para outra DLL. No Windows 10/11, algumas
+  funções da kernel32 são encaminhadas (por exemplo, `HeapAlloc` aponta para
+  `NTDLL.RtlAllocateHeap`), e o carregador não trata esse caso. **Antes de
+  testar no Windows, rode `make -C tiny dllcheck DLLDIR=/c/Windows/SysWOW64`**
+  (no MSYS2) ou `python tiny/tools/apihash.py C:\Windows\SysWOW64`. Se
+  apontar problema, use `make static`.
 - **Antivírus:** executáveis minúsculos com código automodificável costumam
-  disparar falsos positivos (acontece com intros de 4K). Pode ser preciso
-  liberar o arquivo no Windows Defender.
+  disparar falsos positivos (acontece com intros de 4K). Percorrer a PEB e
+  procurar funções por hash é exatamente o que shellcode faz, o que aumenta
+  esse risco. Pode ser preciso liberar o arquivo no Windows Defender; a
+  variante `make static` evita a parte do hash.
 - **BASIC real:** a CPU é idêntica à do emulador em C, mas o modelo das PIAs e
   do SAM é mais simples. Se o BASIC não iniciar, o próximo passo de depuração é
   comparar os dois emuladores rodando a ROM real, com o mesmo `machtest`.
@@ -136,6 +155,9 @@ Requisito: [NASM](https://www.nasm.us/) 2.14 ou mais novo. No MSYS2:
 
 ```sh
 make -C tiny            # gera build/tiny/coco4k.exe e confere os 4096 bytes
+make -C tiny safe       # plano B: cabeçalho PE convencional
+make -C tiny static     # plano C: tabela de importação convencional
+make -C tiny dllcheck DLLDIR=/c/Windows/SysWOW64   # confere os hashes no Windows
 make -C tiny test       # testes diferenciais (Linux ou MSYS2 com gcc -m32)
 ```
 
@@ -159,15 +181,15 @@ Teclado: letras, dígitos, setas, Enter, espaço e Shift funcionam
 normalmente. Além disso: Esc = BREAK, Home = CLEAR e Backspace = seta para a
 esquerda. Para sair, feche a janela.
 
-## Orçamento de bytes (4036 no total)
+## Orçamento de bytes (3892 no total)
 
-| Parte | Bytes |
-|---|---:|
-| Cabeçalhos MZ/PE | 176 |
-| Tabela de importação (12 funções) | 339 |
-| Dados (nomes, paleta, mapa de teclas) | 172 |
-| CPU 6809 | 1974 |
-| PIAs e SAM | 195 |
-| Quadro e vídeo (VDG) | 389 |
-| Fonte 6847 compactada | 286 |
-| Reset e programa Windows | 502 |
+| Parte | Bytes | Antes do hash |
+|---|---:|---:|
+| Cabeçalhos MZ/PE | 160 | 176 |
+| Funções do Windows (hashes 78 + carregador 175) | 253 | 339 (tabela de importação) |
+| Dados (nomes, paleta, mapa de teclas) | 172 | 172 |
+| CPU 6809 | 1974 | 1974 |
+| PIAs e SAM | 195 | 195 |
+| Quadro e vídeo (VDG) | 389 | 389 |
+| Fonte 6847 compactada | 286 | 286 |
+| Reset e programa Windows | 462 | 502 (chamadas de 6 bytes) |

@@ -1,7 +1,11 @@
 # Makefile - coco4k: emulador CoCo 1/2 em um executavel Windows de 4 KB
 #
 #   make            monta build/tiny/coco4k.exe e confere o limite de 4096 bytes
-#   make safe       variante com cabecalho PE convencional (maior que 4 KB)
+#   make safe       variante com cabecalho PE convencional (plano B)
+#   make static     variante com tabela de importacao convencional, em vez
+#                   de carregar as funcoes do Windows por hash (plano C)
+#   make dllcheck DLLDIR=C:/Windows/SysWOW64
+#                   confere colisoes/encaminhamentos dos hashes nas DLLs
 #   make test       testes diferenciais contra o emulador em C
 #                   (Linux/MSYS2 com gcc -m32 e python3)
 #   make font       regenera font.inc a partir de ../src/core/font6847.c
@@ -12,21 +16,32 @@ PYTHON ?= python3
 B       = ../build/tiny
 LIMIT   = 4096
 
-.PHONY: all safe test font clean
+.PHONY: all safe static dllcheck test font clean
+
+DLLDIR ?= /usr/lib/i386-linux-gnu/wine/i386-windows
+
+# monta $(1) com as opcoes $(2) e confere o limite de tamanho
+define build_exe
+	@mkdir -p $(B)
+	$(NASM) -f bin $(2) -o $(1) coco4k.asm
+	@size=$$(wc -c < $(1)); \
+	echo "$(notdir $(1)): $$size bytes (limite $(LIMIT))"; \
+	test $$size -le $(LIMIT) || { echo "ERRO: passou de $(LIMIT) bytes"; exit 1; }
+endef
 
 all: $(B)/coco4k.exe
-	@size=$$(wc -c < $<); \
-	echo "coco4k.exe: $$size bytes (limite $(LIMIT))"; \
-	test $$size -le $(LIMIT) || { echo "ERRO: passou de $(LIMIT) bytes"; exit 1; }
 
 $(B)/coco4k.exe: coco4k.asm core.inc font.inc
-	@mkdir -p $(B)
-	$(NASM) -f bin -o $@ coco4k.asm
+	$(call build_exe,$@,)
 
 safe: coco4k.asm core.inc font.inc
-	@mkdir -p $(B)
-	$(NASM) -f bin -DSAFE_HEADER -o $(B)/coco4k_safe.exe coco4k.asm
-	@echo "coco4k_safe.exe: $$(wc -c < $(B)/coco4k_safe.exe) bytes"
+	$(call build_exe,$(B)/coco4k_safe.exe,-DSAFE_HEADER)
+
+static: coco4k.asm core.inc font.inc
+	$(call build_exe,$(B)/coco4k_static.exe,-DSTATIC_IMPORTS)
+
+dllcheck:
+	$(PYTHON) tools/apihash.py $(DLLDIR)
 
 font:
 	$(PYTHON) tools/mkfont.py ../src/core/font6847.c font.inc

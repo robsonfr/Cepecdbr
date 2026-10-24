@@ -248,7 +248,7 @@ rotinas pelas suas.
 ## coco4k: versão em assembly de 4 KB
 
 O diretório `tiny/` tem um experimento separado: o emulador reescrito em
-assembly x86 de 32 bits, gerando um executável Windows de **4036 bytes**
+assembly x86 de 32 bits, gerando um executável Windows de **3892 bytes**
 (CPU 6809 completa, texto, semigráficos e todos os modos gráficos, teclado;
 sem som, fita e disco). Ele é validado contra este emulador em C por testes
 diferenciais. Veja [`tiny/PLANO.md`](tiny/PLANO.md).

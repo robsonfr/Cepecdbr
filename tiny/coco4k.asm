@@ -4,6 +4,10 @@
 ;
 ; Montagem (sem linker; o cabecalho PE e escrito a mao):
 ;     nasm -f bin -o coco4k.exe coco4k.asm
+; Opcoes:
+;     -DSAFE_HEADER     cabecalho PE convencional (sem sobrepor o MZ)
+;     -DSTATIC_IMPORTS  tabela de importacao convencional em vez de
+;                       carregar as funcoes do Windows por hash
 ;
 ; Uso: coloque no diretorio atual
 ;     bas.rom   Color BASIC (8K, $A000)             - opcional*
@@ -21,8 +25,49 @@ CPU 686
 IMAGEBASE equ 400000h
 SCALE_W   equ 768
 SCALE_H   equ 576
-STATE     equ 128           ; bytes de estado antes da memoria
+STATE     equ 192           ; bytes antes da memoria: tabela de funcoes,
+                            ; variaveis do programa e estado do nucleo
 AREA      equ STATE + 10000h + 256*192
+
+; EBP aponta para EDI-128 durante todo o programa:
+;   [EBP+0..27]   MSG do PeekMessage (inicio do estado do nucleo)
+;   [EBP-8]       horario do proximo quadro (ms * 3)
+;   [EBP-64..]    ponteiros das funcoes do Windows (FN_nome)
+NEXTFRAME equ -8
+FNBASE    equ -64
+
+; Hash dos nomes (calculado pelo NASM): h = ror(h,13) + (c | 20h)
+%macro HASHOF 1
+  %assign __h 0
+  %strlen __n %1
+  %assign __i 1
+  %rep __n
+    %substr __c %1 __i
+    %assign __h ((__h >> 13) | (__h << 19)) & 0FFFFFFFFh
+    %assign __h (__h + (__c | 20h)) & 0FFFFFFFFh
+    %assign __i __i+1
+  %endrep
+%endmacro
+
+%assign __fn 0
+%macro IMPORT 1                 ; hash da funcao e FN_nome = deslocamento
+  %defstr __s %1
+  HASHOF __s
+  dd __h
+  %assign FN_%1 FNBASE + __fn*4
+  %assign __fn __fn+1
+%endmacro
+%macro IMPORT_END 0
+  dd 0
+%endmacro
+
+%macro API 1                    ; chama uma funcao do Windows
+%ifdef STATIC_IMPORTS
+        call [%1]
+%else
+        call [ebp+FN_%1]
+%endif
+%endmacro
 
         org IMAGEBASE
 
@@ -32,12 +77,15 @@ mz:     db 'MZ'
         times 3Ch-($-mz) db 0
         dd pe - mz
 NDIRS   equ 16
-%else
+%elifdef STATIC_IMPORTS
 ; --- cabecalho compacto: o PE comeca no offset 4, dentro do MZ ----------------
 ; O campo e_lfanew (offset 3Ch) cai sobre o SectionAlignment do cabecalho
 ; opcional, que vale 4: os dois valores coincidem.
 mz:     db 'MZ', 0, 0
 NDIRS   equ 2
+%else
+mz:     db 'MZ', 0, 0
+NDIRS   equ 0                       ; sem importacoes: nenhum diretorio
 %endif
 pe:     db 'PE', 0, 0
         dw 014Ch                    ; i386
@@ -64,9 +112,15 @@ opt:    dw 010Bh                    ; PE32
         dd 100000h, 1000h           ; heap
         dd 0
         dd NDIRS                    ; NumberOfRvaAndSizes
+%if NDIRS > 0
         dd 0, 0                     ; exportacoes
+%ifdef STATIC_IMPORTS
         dd imports - IMAGEBASE, imports_end - imports
+%else
+        dd 0, 0
+%endif
         times NDIRS-2 dd 0, 0
+%endif
 opt_end:
 %ifndef SAFE_HEADER
 %if (mz + 3Ch) != (opt + 32)
@@ -82,7 +136,8 @@ opt_end:
         dd 0E0000020h               ; codigo, executavel, leitura, escrita
 hdr_end:
 
-; --- importacoes ------------------------------------------------------------------
+%ifdef STATIC_IMPORTS
+; --- importacoes convencionais (plano B) -------------------------------------------
 imports:
         dd 0, 0, 0, n_k32 - IMAGEBASE, k32 - IMAGEBASE
         dd 0, 0, 0, n_u32 - IMAGEBASE, u32 - IMAGEBASE
@@ -123,6 +178,120 @@ h_GetDC:            db 0, 0, 'GetDC', 0
 h_GetAsyncKeyState: db 0, 0, 'GetAsyncKeyState', 0
 h_IsWindow:         db 0, 0, 'IsWindow', 0
 h_StretchDIBits:    db 0, 0, 'StretchDIBits', 0
+%else
+; --- funcoes do Windows carregadas por hash -----------------------------------------
+; A kernel32 e localizada pela PEB; as outras DLLs, carregadas com LoadLibraryA.
+; Cada IMPORT_END encerra a lista de uma DLL e carrega a proxima de 'dllnames'.
+; Confira colisoes/encaminhamentos com: python3 tools/apihash.py <dir. das DLLs>
+dllnames:
+        db 'user32', 0
+        db 'gdi32', 0
+        db 0
+
+apihashes:
+        IMPORT LoadLibraryA         ; precisa ser a primeira
+        IMPORT _lopen
+        IMPORT _lread
+        IMPORT Sleep
+        IMPORT GetTickCount
+        IMPORT ExitProcess
+        IMPORT_END
+        IMPORT CreateWindowExA
+        IMPORT PeekMessageA
+        IMPORT DispatchMessageA
+        IMPORT GetDC
+        IMPORT GetAsyncKeyState
+        IMPORT IsWindow
+        IMPORT_END
+        IMPORT StretchDIBits
+        IMPORT_END
+
+%if FN_LoadLibraryA != FNBASE || __fn*4 > NEXTFRAME - FNBASE
+%error "tabela de funcoes nao cabe na area reservada"
+%endif
+HASHOF 'kernel32.dll'
+%assign K32HASH __h
+
+; resolve: preenche [EBP+FN_*] com os enderecos das funcoes
+resolve:
+        mov eax, [fs:30h]           ; PEB
+        mov eax, [eax+0Ch]          ; PEB->Ldr
+        mov ecx, [eax+14h]          ; InMemoryOrderModuleList (1o modulo)
+.mod:   mov esi, [ecx+28h]          ; BaseDllName.Buffer (UTF-16)
+        mov ebx, [ecx+10h]          ; DllBase
+        mov ecx, [ecx]              ; proximo modulo
+        xor eax, eax
+        cdq
+.mc:    lodsw                       ; hash do nome do modulo
+        test eax, eax
+        jz .me
+        or al, 20h
+        ror edx, 13
+        add edx, eax
+        jmp .mc
+.me:    cmp edx, K32HASH
+        jne .mod
+
+        mov esi, apihashes
+        lea edx, [ebp+FNBASE]       ; destino dos ponteiros
+        mov ecx, dllnames
+.l:     lodsd
+        test eax, eax
+        jz .dll
+        pushad
+        call find_export
+        mov [esp+28], eax           ; EAX devolvido pelo popad
+        popad
+        mov [edx], eax
+        add edx, 4
+        jmp .l
+.dll:   cmp byte [ecx], 0           ; acabaram as DLLs?
+        je .x
+        push edx
+        push ecx
+        push ecx
+        API LoadLibraryA
+        xchg ebx, eax               ; EBX = base da nova DLL
+        pop ecx
+        pop edx
+.sk:    inc ecx                     ; avanca para o proximo nome
+        cmp byte [ecx-1], 0
+        jne .sk
+        jmp .l
+.x:     ret
+
+; find_export: EBX = base da DLL, EAX = hash -> EAX = endereco da funcao
+find_export:
+        xchg ebp, eax               ; EBP = hash (restaurado pelo popad)
+        mov eax, [ebx+3Ch]          ; cabecalho PE
+        mov edi, [ebx+eax+78h]      ; diretorio de exportacao
+        add edi, ebx
+        mov ecx, [edi+18h]          ; NumberOfNames
+.next:  dec ecx
+        mov esi, [edi+20h]          ; AddressOfNames
+        add esi, ebx
+        mov esi, [esi+ecx*4]
+        add esi, ebx
+        xor eax, eax
+        cdq
+.h:     lodsb
+        test al, al
+        jz .e
+        or al, 20h
+        ror edx, 13
+        add edx, eax
+        jmp .h
+.e:     cmp edx, ebp
+        jne .next
+        mov esi, [edi+24h]          ; AddressOfNameOrdinals
+        add esi, ebx
+        movzx ecx, word [esi+ecx*2]
+        mov esi, [edi+1Ch]          ; AddressOfFunctions
+        add esi, ebx
+        mov eax, [esi+ecx*4]
+        add eax, ebx
+        ret
+%endif
 
 ; --- dados ------------------------------------------------------------------------
 s_static: db 'static', 0
@@ -162,9 +331,9 @@ load_rom:                       ; ESI = nome, EBX = destino, ECX = tamanho
         push eax
         push 0
         push esi
-        call [_lopen]
+        API _lopen
         push eax
-        call [_lread]           ; arquivo ausente: _lread(-1) apenas falha
+        API _lread           ; arquivo ausente: _lread(-1) apenas falha
         ret
 
 start:
@@ -177,6 +346,10 @@ start:
         xor eax, eax
         rep stosb
         lea edi, [esp+STATE]
+        lea ebp, [edi-128]
+%ifndef STATIC_IMPORTS
+        call resolve
+%endif
 
         mov esi, stubvec        ; vetores padrao (sem BASIC)
         push edi
@@ -223,34 +396,33 @@ start:
         push s_title
         push s_static
         push eax
-        call [CreateWindowExA]
+        API CreateWindowExA
         xchg ebx, eax           ; EBX = janela
         push ebx
-        call [GetDC]
+        API GetDC
         xchg esi, eax           ; ESI = contexto de desenho
-        call [GetTickCount]
-        imul ebp, eax, 3        ; EBP = proximo quadro (ms * 3)
+        API GetTickCount
+        imul eax, eax, 3
+        mov [ebp+NEXTFRAME], eax ; proximo quadro (ms * 3)
 
 main:   xor eax, eax            ; mensagens
         push 1
         push eax
         push eax
         push eax
-        lea ecx, [edi-STATE]
-        push ecx
-        call [PeekMessageA]
+        push ebp                ; MSG em [EBP]
+        API PeekMessageA
         test eax, eax
         jz .nomsg
-        lea ecx, [edi-STATE]
-        push ecx
-        call [DispatchMessageA]
+        push ebp
+        API DispatchMessageA
         jmp main
 .nomsg: push ebx
-        call [IsWindow]
+        API IsWindow
         test eax, eax
         jnz .alive
         push eax
-        call [ExitProcess]
+        API ExitProcess
 .alive: call keyboard
         call core_frame
 
@@ -268,15 +440,15 @@ main:   xor eax, eax            ; mensagens
         push 0
         push 0
         push esi
-        call [StretchDIBits]
+        API StretchDIBits
 
-        add ebp, 50             ; 1000/60 ms (em unidades de 1/3 ms)
-.wait:  call [GetTickCount]
+        add dword [ebp+NEXTFRAME], 50 ; 1000/60 ms (em unidades de 1/3 ms)
+.wait:  API GetTickCount
         lea eax, [eax+eax*2]
-        cmp eax, ebp
+        cmp eax, [ebp+NEXTFRAME]
         jns main
         push 1
-        call [Sleep]
+        API Sleep
         jmp .wait
 
 keyboard:                       ; preenche a matriz KEYM com as teclas do PC
@@ -286,7 +458,7 @@ keyboard:                       ; preenche a matriz KEYM com as teclas do PC
         mov [edi+KEYM+4], eax
         mov ebx, '0'            ; digitos e letras
 .l:     push ebx
-        call [GetAsyncKeyState]
+        API GetAsyncKeyState
         test ax, ax
         jns .n
         mov eax, ebx
@@ -307,7 +479,7 @@ keyboard:                       ; preenche a matriz KEYM com as teclas do PC
         movzx ebx, ah
         movzx eax, al
         push eax
-        call [GetAsyncKeyState]
+        API GetAsyncKeyState
         test ax, ax
         jns .t
         mov eax, ebx
