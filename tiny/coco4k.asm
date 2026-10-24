@@ -8,6 +8,7 @@
 ;     -DSAFE_HEADER     cabecalho PE convencional (sem sobrepor o MZ)
 ;     -DSTATIC_IMPORTS  tabela de importacao convencional em vez de
 ;                       carregar as funcoes do Windows por hash
+;     -DNO_AUDIO        sem som (as variantes acima so cabem em 4 KB assim)
 ;
 ; Uso: coloque no diretorio atual
 ;     bas.rom   Color BASIC (8K, $A000)             - opcional*
@@ -25,16 +26,27 @@ CPU 686
 IMAGEBASE equ 400000h
 SCALE_W   equ 768
 SCALE_H   equ 576
-STATE     equ 192           ; bytes antes da memoria: tabela de funcoes,
+STATE     equ 208           ; bytes antes da memoria: tabela de funcoes,
                             ; variaveis do programa e estado do nucleo
-AREA      equ STATE + 10000h + 256*192
+NBUF      equ 8             ; buffers de audio em anel (1 quadro cada)
+ASLOT     equ 32 + 262      ; WAVEHDR + 262 amostras (1 por linha)
+AUD       equ 10000h + 256*192  ; buffers de audio, depois da tela
+AREA      equ STATE + AUD + NBUF*ASLOT
 
 ; EBP aponta para EDI-128 durante todo o programa:
 ;   [EBP+0..27]   MSG do PeekMessage (inicio do estado do nucleo)
 ;   [EBP-8]       horario do proximo quadro (ms * 3)
-;   [EBP-64..]    ponteiros das funcoes do Windows (FN_nome)
+;   [EBP-12]      dispositivo de audio (HWAVEOUT)
+;   [EBP-16]      indice do buffer de audio atual
+;   [EBP-80..]    ponteiros das funcoes do Windows (FN_nome)
 NEXTFRAME equ -8
-FNBASE    equ -64
+HWO       equ -12
+AIDX      equ -16
+FNBASE    equ -80
+
+%ifndef NO_AUDIO
+%define AUDIO               ; o nucleo grava as amostras do DAC
+%endif
 
 ; Hash dos nomes (calculado pelo NASM): h = ror(h,13) + (c | 20h)
 %macro HASHOF 1
@@ -142,6 +154,9 @@ imports:
         dd 0, 0, 0, n_k32 - IMAGEBASE, k32 - IMAGEBASE
         dd 0, 0, 0, n_u32 - IMAGEBASE, u32 - IMAGEBASE
         dd 0, 0, 0, n_g32 - IMAGEBASE, g32 - IMAGEBASE
+%ifdef AUDIO
+        dd 0, 0, 0, n_wmm - IMAGEBASE, wmm - IMAGEBASE
+%endif
         dd 0, 0, 0, 0, 0
 imports_end:
 k32:
@@ -162,6 +177,17 @@ IsWindow:         dd h_IsWindow - IMAGEBASE
 g32:
 StretchDIBits:    dd h_StretchDIBits - IMAGEBASE
                   dd 0
+%ifdef AUDIO
+wmm:
+waveOutOpen:          dd h_waveOutOpen - IMAGEBASE
+waveOutPrepareHeader: dd h_waveOutPrepareHeader - IMAGEBASE
+waveOutWrite:         dd h_waveOutWrite - IMAGEBASE
+                      dd 0
+n_wmm:  db 'WINMM.dll', 0
+h_waveOutOpen:          db 0, 0, 'waveOutOpen', 0
+h_waveOutPrepareHeader: db 0, 0, 'waveOutPrepareHeader', 0
+h_waveOutWrite:         db 0, 0, 'waveOutWrite', 0
+%endif
 
 n_k32:  db 'KERNEL32.dll', 0
 n_u32:  db 'USER32.dll', 0
@@ -186,6 +212,9 @@ h_StretchDIBits:    db 0, 0, 'StretchDIBits', 0
 dllnames:
         db 'user32', 0
         db 'gdi32', 0
+%ifdef AUDIO
+        db 'winmm', 0
+%endif
         db 0
 
 apihashes:
@@ -205,8 +234,14 @@ apihashes:
         IMPORT_END
         IMPORT StretchDIBits
         IMPORT_END
+%ifdef AUDIO
+        IMPORT waveOutOpen
+        IMPORT waveOutPrepareHeader
+        IMPORT waveOutWrite
+        IMPORT_END
+%endif
 
-%if FN_LoadLibraryA != FNBASE || __fn*4 > NEXTFRAME - FNBASE
+%if FN_LoadLibraryA != FNBASE || FNBASE + __fn*4 > AIDX
 %error "tabela de funcoes nao cabe na area reservada"
 %endif
 HASHOF 'kernel32.dll'
@@ -303,6 +338,14 @@ s_cart:   db 'cart.rom', 0
 ; vetores usados sem bas.rom ($FFF2-$FFFF): interrupcoes na RAM como no
 ; BASIC e RESET no cartucho
 stubvec: dw 0001h, 0301h, 0F01h, 0C01h, 0601h, 0901h, 00C0h   ; big-endian
+
+%ifdef AUDIO
+; WAVEFORMATEX: PCM 8 bits mono, 1 amostra por linha de video
+; (262 linhas * 59,923 quadros/s = 15700 Hz)
+wfx:    dw 1, 1
+        dd 15700, 15700
+        dw 1, 8, 0
+%endif
 
 ; BITMAPINFO 8 bits, de cima para baixo, com a paleta do CoCo
 bmi:    dd 40, 256, -192
@@ -401,6 +444,17 @@ start:
         push ebx
         API GetDC
         xchg esi, eax           ; ESI = contexto de desenho
+%ifdef AUDIO
+        xor eax, eax            ; waveOutOpen(&hwo, WAVE_MAPPER, &wfx, 0, 0, 0)
+        push eax
+        push eax
+        push eax
+        push wfx
+        push -1
+        lea ecx, [ebp+HWO]
+        push ecx
+        API waveOutOpen         ; sem dispositivo: HWO fica 0 e o resto falha
+%endif
         API GetTickCount
         imul eax, eax, 3
         mov [ebp+NEXTFRAME], eax ; proximo quadro (ms * 3)
@@ -424,21 +478,49 @@ main:   xor eax, eax            ; mensagens
         push eax
         API ExitProcess
 .alive: call keyboard
+%ifdef AUDIO
+        movzx eax, byte [ebp+AIDX]  ; buffer de audio deste quadro
+        imul edx, eax, ASLOT
+        lea edx, [edi+AUD+edx]      ; EDX -> WAVEHDR
+        lea eax, [edx+32]
+        mov [edx], eax              ; lpData
+        mov dword [edx+4], LINES    ; dwBufferLength
+        mov [edi+V_APTR], eax       ; o nucleo grava as amostras aqui
+        push edx
         call core_frame
+        pop edx
+        test byte [edx+16], 10h     ; WHDR_INQUEUE: ainda tocando, descarta
+        jnz .busy
+        mov eax, [ebp+HWO]
+        push 32
+        push edx
+        push eax
+        push 32
+        push edx
+        push eax
+        API waveOutPrepareHeader
+        API waveOutWrite
+        inc byte [ebp+AIDX]
+        and byte [ebp+AIDX], NBUF-1
+.busy:
+%else
+        call core_frame
+%endif
 
+        xor ecx, ecx
         push 0CC0020h           ; SRCCOPY
-        push 0                  ; DIB_RGB_COLORS
+        push ecx                ; DIB_RGB_COLORS
         push bmi
         lea eax, [edi+FB]
         push eax
         push 192
         push 256
-        push 0
-        push 0
+        push ecx
+        push ecx
         push SCALE_H
         push SCALE_W
-        push 0
-        push 0
+        push ecx
+        push ecx
         push esi
         API StretchDIBits
 

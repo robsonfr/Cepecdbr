@@ -17,6 +17,8 @@
 ;   read8/write8: ECX = endereco, AL = dado; preservam EBX, EDX, ESI, EBP.
 ;   read16/write16: idem, mas destroem ECX.
 ;   TESTMODE: memoria plana de 64K sem E/S (testes diferenciais da CPU).
+;   AUDIO: grava uma amostra de 8 bits por linha (262 por quadro, ~15,7 kHz)
+;          em [V_APTR]: o nivel do DAC, ou 80h se o som estiver desligado.
 ; =============================================================================
 
 R_D     equ -32         ; D = A:B (palavra little-endian: B em -32, A em -31)
@@ -41,6 +43,7 @@ P0B     equ PIA+4
 P1A     equ PIA+8
 P1B     equ PIA+12
 KEYM    equ -80         ; matriz do teclado: KEYM[coluna] = linhas pressionadas
+V_APTR  equ -100        ; (AUDIO) destino das amostras do quadro (dd)
 FB      equ 10000h      ; tela 256x192
 CYC_LINE equ 57         ; ciclos de CPU por linha (NTSC)
 LINES   equ 262
@@ -153,9 +156,12 @@ idx:                            ; modo indexado -> ECX
         sar al, 3
         movsx eax, al
         add esi, eax
+        CYC 1
         jmp .done
 .long:  mov eax, ebx
         and eax, 0Fh
+        movzx ecx, byte [idxcyc+eax] ; ciclos extras do modo
+        add [edi+V_CYC], ecx
         movzx eax, byte [idxtab+eax]
         add eax, .base
         jmp eax
@@ -202,6 +208,8 @@ idx:                            ; modo indexado -> ECX
         pop ebx
         ret
 
+; ciclos extras de cada modo indexado (manual do 6809; [n16] soma 3 a parte)
+idxcyc: db 2, 3, 2, 3, 0, 1, 1, 0, 1, 4, 0, 4, 1, 5, 0, 2
 idxtab: db idx.i0-idx.base, idx.i1-idx.base, idx.i2-idx.base, idx.i3-idx.base
         db idx.post-idx.base, idx.i5-idx.base, idx.i6-idx.base, idx.post-idx.base
         db idx.i8-idx.base, idx.i9-idx.base, idx.post-idx.base, idx.iB-idx.base
@@ -233,13 +241,12 @@ slot:   db 90h, 90h, 90h, 90h
         mov cl, bl
         shr cl, 4
         and cl, 0Ch             ; N Z
-        test bl, 1
-        jz .1
-        or cl, 1                ; C
-.1:     test bl, 10h
-        jz .2
-        or cl, 20h              ; H
-.2:     test bh, 8
+        mov al, bl              ; A (bit 4) -> H (bit 5), C fica no bit 0
+        and al, 11h
+        add al, 10h
+        and al, 21h
+        or cl, al
+        test bh, 8
         jz .3
         or cl, 2                ; V
 .3:     and cl, dh
@@ -306,7 +313,7 @@ step:
         jne .noirq
         test byte [edi+R_CC], 10h
         jnz .noirq
-        CYC 19
+        CYC 7                   ; 19 com os 12 do empilhamento
         lea esi, [edi+R_S]
         cmp byte [edi+V_CWAI], 0
         jne .nopush
@@ -355,6 +362,7 @@ rmw:    sub al, 4
         cmp al, 0Eh
         jne .op
         mov [edi+R_PC], cx      ; JMP
+        dec dword [edi+V_CYC]
         ret
 .op:    push ecx
         push ebx
@@ -362,10 +370,10 @@ rmw:    sub al, 4
         call unary
         pop ebx
         pop ecx
+        CYC 2
         and bl, 0Fh
         cmp bl, 0Dh             ; TST nao grava
         je .r
-        CYC 2
         jmp write8
 .r:     ret
 
@@ -425,6 +433,7 @@ op16:   add ecx, ecx
         mov cl, [ebp]
         cmp cl, 0FEh
         je jsr_bsr
+        CYC 1                   ; 16 bits: 1 ciclo a mais que 8 bits
         cmp cl, 0FFh
         je .store
         test dl, dl             ; paginas 2/3: SUBD vira CMPD/CMPU
@@ -432,7 +441,10 @@ op16:   add ecx, ecx
         cmp cl, 28h
         jne .b
         mov cl, 38h
-.b:     push ecx
+.b:     cmp cl, 88h
+        je .ld
+        CYC 1                   ; aritmetica de 16 bits: mais 1 ciclo
+.ld:    push ecx
         mov edx, 2
         call ea_mode
         call read16
@@ -469,6 +481,7 @@ jsr_bsr:                        ; AL = modo (0 = BSR)
         call fetch8
         movsx ecx, al
         add cx, [edi+R_PC]
+        CYC 2                   ; BSR: 7 ciclos
         jmp jsr_go
 .jsr:   call ea_mode
 jsr_go: push ecx
@@ -482,6 +495,7 @@ jsr_go: push ecx
 ; --- desvios $20-$2F (e longos com prefixo $10) ------------------------------
 branch: cmp byte [edi+V_PAGE], 1
         jne .s
+        inc dword [edi+V_CYC]   ; longo: 5 ciclos (6 se tomado)
         call fetch16
         jmp .t
 .s:     call fetch8
@@ -491,6 +505,8 @@ branch: cmp byte [edi+V_PAGE], 1
         call cond
         jnc .n
         add [edi+R_PC], cx
+        movzx eax, byte [edi+V_PAGE] ; longo tomado: +1
+        add [edi+V_CYC], eax
 .n:     CYC 1
         ret
 
@@ -524,15 +540,16 @@ grp1:   mov eax, ebx
         add eax, g1base
         jmp eax
 g1base:
-pg2:    mov byte [edi+V_PAGE], 1
-        jmp decode
-pg3:    mov byte [edi+V_PAGE], 2
+pg3:    inc byte [edi+V_PAGE]   ; $11 -> pagina 2
+pg2:    inc byte [edi+V_PAGE]   ; $10 -> pagina 1
+        dec dword [edi+V_CYC]   ; o prefixo custa 1 ciclo, nao 2
         jmp decode
 lbra:   call fetch16
         add [edi+R_PC], ax
         CYC 3
 nop_:   ret
 lbsr:   call fetch16
+        CYC 4
         add ax, [edi+R_PC]
         xchg ecx, eax
         jmp jsr_go
@@ -567,7 +584,8 @@ sex_:   mov al, [edi+R_B]
         mov ecx, 0C08566h       ; test ax,ax
         mov edx, 0C10h
         jmp doop
-xfer:   call fetch8             ; EXG ($1E) / TFR ($1F)
+xfer:   CYC 4                   ; TFR 6 ciclos (EXG 8: aproximado)
+        call fetch8             ; EXG ($1E) / TFR ($1F)
         xchg edx, eax           ; DL = pos-byte
         mov eax, edx
         shr eax, 4
@@ -661,7 +679,8 @@ rts_:   call pullw_s
 abx_:   movzx eax, byte [edi+R_B]
         add [edi+R_X], ax
         ret
-rti_:   lea esi, [edi+R_S]
+rti_:   inc dword [edi+V_CYC]   ; 6 ou 15 com os bytes desempilhados
+        lea esi, [edi+R_S]
         mov dl, 1
         call pull_regs
         mov dl, 80h
@@ -698,7 +717,7 @@ swi_:   or byte [edi+R_CC], 80h
         jnz .v
         or byte [edi+R_CC], 50h ; SWI mascara IRQ e FIRQ
 .v:     movzx ecx, word [swivec+eax*2]
-        CYC 15
+        CYC 5                   ; 19 com o empilhamento
         jmp load_pc
 
 g3tab:  db lea_-g3base, lea_-g3base, lea_-g3base, lea_-g3base
@@ -732,6 +751,7 @@ push_regs:
         movzx eax, word [edi+eax]
         sub word [esi], 2
         movzx ecx, word [esi]
+        inc dword [edi+V_CYC]   ; 16 bits: 2 ciclos
         call write16
         jmp .c
 .b:     mov al, [edi+eax]
@@ -756,6 +776,7 @@ pull_regs:
         cmp bl, 4
         jae .b
         add word [esi], 2
+        inc dword [edi+V_CYC]
         call read16
         pop ecx
         mov [edi+ecx], ax
@@ -862,7 +883,7 @@ io_write:
 ; -----------------------------------------------------------------------------
 core_frame:
         pushad
-        mov word [edi+V_LINE], 0
+        and word [edi+V_LINE], 0
 .line:  add dword [edi+V_TGT], CYC_LINE
 .run:   mov eax, [edi+V_CYC]
         cmp eax, [edi+V_TGT]
@@ -874,7 +895,14 @@ core_frame:
         or byte [edi+P0B+2], 80h ; flag de FS (sincronismo de quadro)
 .nf:
 %ifdef AUDIO
-        call audio_sample
+        mov al, [edi+P1A+1]     ; DAC: PA2-PA7 da PIA1
+        and al, 0FCh
+        test byte [edi+P1B+2], 8 ; CB2 da PIA1 = 1: som habilitado
+        jnz .snd
+        mov al, 80h             ; silencio
+.snd:   movzx ecx, word [edi+V_LINE]
+        add ecx, [edi+V_APTR]
+        mov [ecx], al
 %endif
         inc word [edi+V_LINE]
         cmp word [edi+V_LINE], LINES
@@ -922,7 +950,6 @@ pixel:  ; ECX = y, EBX = x, EBP = modo, ESI = base -> AL = indice de cor
         shr ecx, 3
         add eax, ecx
         add eax, esi
-        movzx eax, ax
         movzx eax, byte [edi+eax]
         test al, al
         js .sg4
@@ -988,7 +1015,6 @@ pixel:  ; ECX = y, EBX = x, EBP = modo, ESI = base -> AL = indice de cor
         shr edx, 3
         add eax, edx
         add eax, esi
-        movzx eax, ax
         movzx eax, byte [edi+eax]
         pop edx
         test dl, 1
@@ -1019,13 +1045,8 @@ gtab:   db 13h, 13h, 23h, 12h, 22h, 11h, 21h, 21h   ; bytes/16 << 4 | repeticao
 %endif ; TESTMODE
 
 ; -----------------------------------------------------------------------------
-core_reset:                     ; zera o estado e carrega PC do vetor de RESET
-        push edi
-        sub edi, 128
-        xor eax, eax
-        mov ecx, 128
-        rep stosb
-        pop edi
+core_reset:                     ; carrega PC do vetor de RESET
+                                ; (o estado em EDI-128 deve estar zerado)
         mov byte [edi+R_CC], 50h
         mov ecx, 0FFFEh
         jmp load_pc

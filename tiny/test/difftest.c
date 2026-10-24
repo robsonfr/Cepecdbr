@@ -26,6 +26,7 @@
 #define R_CC  (-20)
 #define R_DP  (-19)
 #define P0B_CR (-64 + 4 + 2)
+#define V_CYC  (-16)
 
 extern void t_step(uint8_t *mem);
 
@@ -68,7 +69,8 @@ static void dump(const char *who, mc6809 *c)
 int main(int argc, char **argv)
 {
     long iters = argc > 1 ? atol(argv[1]) : 1000000;
-    long i, fails = 0;
+    long i, fails = 0, cycdiff = 0;
+    static long cyc_by_op[3][256];     /* instrucoes com ciclos diferentes */
     mc6809 c;
     if (argc > 2) rng = (uint32_t)atol(argv[2]);
 
@@ -107,8 +109,18 @@ int main(int argc, char **argv)
         set_aw(R_X, c.x); set_aw(R_Y, c.y); set_aw(R_U, c.u); set_aw(R_S, c.s); set_aw(R_PC, c.pc);
         before = c;
 
-        mc6809_step(&c);
-        t_step(amem);
+        {
+            int cc = mc6809_step(&c), ac;
+            int32_t v;
+            t_step(amem);
+            memcpy(&v, amem + V_CYC, 4);
+            ac = v;
+            if (ac != cc) {
+                int pg = cmem[pc] == 0x10 ? 1 : cmem[pc] == 0x11 ? 2 : 0;
+                cycdiff++;
+                cyc_by_op[pg][cmem[(uint16_t)(pc + (pg ? 1 : 0))]]++;
+            }
+        }
 
         if (amem[R_A] != c.a || amem[R_B] != c.b || amem[R_DP] != c.dp || amem[R_CC] != c.cc ||
             aw(R_X) != c.x || aw(R_Y) != c.y || aw(R_U) != c.u || aw(R_S) != c.s ||
@@ -130,5 +142,13 @@ int main(int argc, char **argv)
         }
     }
     printf("%ld instrucoes testadas, %ld diferencas\n", i, fails);
+    if (getenv("CICLOS")) {
+        int pg, op;
+        printf("ciclos diferentes em %.1f%% das instrucoes; por opcode:\n", 100.0 * cycdiff / i);
+        for (pg = 0; pg < 3; pg++)
+            for (op = 0; op < 256; op++)
+                if (cyc_by_op[pg][op])
+                    printf("  %s%02X: %ld\n", pg == 1 ? "10 " : pg == 2 ? "11 " : "", op, cyc_by_op[pg][op]);
+    }
     return fails ? 1 : 0;
 }
