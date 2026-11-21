@@ -40,6 +40,18 @@ uint8_t *media_read_file(const char *path, size_t *size)
     return buf;
 }
 
+int media_write_file(const char *path, const uint8_t *data, size_t size)
+{
+    FILE *f = fopen(path, "wb");
+    int ok;
+    if (!f)
+        return -1;
+    ok = fwrite(data, 1, size, f) == size;
+    if (fclose(f) != 0)
+        ok = 0;
+    return ok ? 0 : -1;
+}
+
 /* ------------------------------------------------------------------------ */
 /* ROMs                                                                     */
 /* ------------------------------------------------------------------------ */

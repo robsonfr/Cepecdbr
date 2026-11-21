@@ -8,6 +8,13 @@
  *                    [--ppm saida.ppm] [-0 disco.dsk] [--cas fita.cas]
  *                    [--rom arquivo] (ROM de 8K em $A000, ignora --rom-dir)
  *                    [--wav saida.raw] (audio PCM 16 bits mono 44100 Hz)
+ *                    [--no-ext] [--no-disk]
+ *                    [--cart arquivo] (cartucho em $C000)
+ *                    [--no-rom]  (sem ROMs: RESET salta para o cartucho)
+ *                    [--load-state arq] (restaura snapshot apos o reset)
+ *                    [--save-state arq] (grava snapshot ao final)
+ *                    [--diag]  (relatorio para depuracao: onde a CPU passa o
+ *                               tempo, registradores, perifericos, RAM baixa)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +39,73 @@ static void audio_samples(void *user, const int16_t *samples, int count)
     headless *hl = (headless *)((media *)user)->app;
     if (hl->audio_out)
         fwrite(samples, sizeof(int16_t), (size_t)count, hl->audio_out);
+}
+
+/* Amostragem do PC ao fim de cada quadro (para achar lacos travados). */
+#define MAX_SAMPLES 64
+typedef struct pc_sample { uint16_t pc; int count; } pc_sample;
+
+static void sample_pc(coco *m, pc_sample *tab, int *n)
+{
+    coco_cpu_state st;
+    int k;
+    coco_get_cpu_state(m, &st);
+    for (k = 0; k < *n; k++) {
+        if (tab[k].pc == st.pc) { tab[k].count++; return; }
+    }
+    if (*n < MAX_SAMPLES) {
+        tab[*n].pc = st.pc;
+        tab[*n].count = 1;
+        (*n)++;
+    }
+}
+
+static void hexdump(coco *m, uint16_t start, int len)
+{
+    int k;
+    for (k = 0; k < len; k++) {
+        if (k % 16 == 0) printf("%s  %04X:", k ? "\n" : "", (uint16_t)(start + k));
+        printf(" %02X", coco_peek(m, (uint16_t)(start + k)));
+    }
+    printf("\n");
+}
+
+static void diag_report(coco *m, pc_sample *tab, int n)
+{
+    coco_io_state io;
+    int k, j, shown;
+
+    /* ordena por contagem (decrescente) */
+    for (k = 0; k < n; k++)
+        for (j = k + 1; j < n; j++)
+            if (tab[j].count > tab[k].count) { pc_sample t = tab[k]; tab[k] = tab[j]; tab[j] = t; }
+
+    printf("\n=== PCs mais frequentes (amostrados a cada quadro) ===\n");
+    for (k = 0, shown = 0; k < n && shown < 6; k++, shown++) {
+        uint16_t pc = tab[k].pc;
+        printf("PC=%04X  amostras=%d\n", pc, tab[k].count);
+        hexdump(m, (uint16_t)(pc - 16), 48);
+    }
+
+    coco_get_io_state(m, &io);
+    printf("\n=== Perifericos ===\n");
+    printf("SAM=%04X (V=%d F=%02X P1=%d R=%d M=%d TY=%d)  VDG=%02X\n",
+           io.sam, io.sam & 7, (io.sam >> 3) & 0x7f, (io.sam >> 10) & 1,
+           (io.sam >> 11) & 3, (io.sam >> 13) & 3, (io.sam >> 15) & 1, io.vdg_mode);
+    printf("PIA0: CRA=%02X CRB=%02X DDRA=%02X DDRB=%02X ORA=%02X ORB=%02X\n",
+           io.pia0_cra, io.pia0_crb, io.pia0_ddra, io.pia0_ddrb, io.pia0_ora, io.pia0_orb);
+    printf("PIA1: CRA=%02X CRB=%02X DDRA=%02X DDRB=%02X ORA=%02X ORB=%02X\n",
+           io.pia1_cra, io.pia1_crb, io.pia1_ddra, io.pia1_ddrb, io.pia1_ora, io.pia1_orb);
+    printf("FDC: FF40=%02X ST=%02X TRK=%02X SEC=%02X CMD=%02X\n",
+           io.ff40, io.fdc_status, io.fdc_track, io.fdc_sector, io.fdc_command);
+    printf("Linhas: IRQ=%d FIRQ=%d NMI=%d HALT=%d\n", io.irq, io.firq, io.nmi, io.halted);
+
+    printf("\n=== RAM $0000-$01FF ===\n");
+    hexdump(m, 0x0000, 0x200);
+    printf("\n=== Tela $0400-$043F ===\n");
+    hexdump(m, 0x0400, 0x40);
+    printf("\n=== Vetores $FFF0-$FFFF ===\n");
+    hexdump(m, 0xfff0, 16);
 }
 
 static int save_ppm(const char *path, const uint8_t *fb)
@@ -96,8 +170,12 @@ int main(int argc, char **argv)
     coco *m;
     const char *rom_dir = "roms", *rom = NULL, *ppm = NULL, *type = NULL;
     const char *cas = NULL, *wav = NULL;
+    const char *cart = NULL, *load_state = NULL, *save_state = NULL;
+    int no_rom = 0;
     const char *disks[MEDIA_MAX_DRIVES] = { NULL, NULL, NULL, NULL };
     int frames = 300, i, boot_frames = 120;
+    int want_ext = 1, want_disk = 1, diag = 0, nsamples = 0;
+    pc_sample samples[MAX_SAMPLES];
     coco_cpu_state st;
 
     memset(&hl, 0, sizeof(hl));
@@ -110,7 +188,11 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         const char *o = argv[i];
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
-        if (!v && strcmp(o, "--help")) { fprintf(stderr, "faltou argumento para %s\n", o); return 1; }
+        if (!strcmp(o, "--no-ext"))       { want_ext = 0; continue; }
+        if (!strcmp(o, "--no-disk"))      { want_disk = 0; continue; }
+        if (!strcmp(o, "--diag"))         { diag = 1; continue; }
+        if (!strcmp(o, "--no-rom"))       { no_rom = 1; continue; }
+        if (!v) { fprintf(stderr, "faltou argumento para %s\n", o); return 1; }
         if (!strcmp(o, "--rom-dir"))      { rom_dir = v; i++; }
         else if (!strcmp(o, "--rom"))     { rom = v; i++; }
         else if (!strcmp(o, "--frames"))  { frames = atoi(v); i++; }
@@ -119,6 +201,9 @@ int main(int argc, char **argv)
         else if (!strcmp(o, "--ppm"))     { ppm = v; i++; }
         else if (!strcmp(o, "--cas"))     { cas = v; i++; }
         else if (!strcmp(o, "--wav"))     { wav = v; i++; }
+        else if (!strcmp(o, "--cart"))    { cart = v; i++; }
+        else if (!strcmp(o, "--load-state")) { load_state = v; i++; }
+        else if (!strcmp(o, "--save-state")) { save_state = v; i++; }
         else if (!strcmp(o, "--model"))   { cfg.model = atoi(v) == 1 ? COCO_MODEL_1 : COCO_MODEL_2; i++; }
         else if (!strcmp(o, "--ram"))     { cfg.ram_kb = atoi(v); i++; }
         else if (o[0] == '-' && o[1] >= '0' && o[1] <= '3' && !o[2]) { disks[o[1] - '0'] = v; i++; }
@@ -132,23 +217,46 @@ int main(int argc, char **argv)
     if (wav) hl.audio_out = fopen(wav, "wb");
 
     m = coco_create(&cfg, &host);
-    if (rom) {
+    if (no_rom) {
+        if (!cart) { fprintf(stderr, "--no-rom exige --cart\n"); return 1; }
+        coco_load_boot_stub(m, 0xc000);
+    } else if (rom) {
         size_t size;
         uint8_t *data = media_read_file(rom, &size);
         if (!data) { fprintf(stderr, "nao foi possivel ler %s\n", rom); return 1; }
         coco_load_rom(m, COCO_ROM_COLOR_BASIC, data, size);
         free(data);
-    } else if (!(media_load_roms(m, rom_dir, 1, 1) & 1)) {
+    } else if (!(media_load_roms(m, rom_dir, want_ext, want_disk) & 1)) {
         fprintf(stderr, "ROM do Color BASIC nao encontrada em %s\n", rom_dir);
         return 1;
+    }
+    if (cart) {
+        size_t size;
+        uint8_t *data = media_read_file(cart, &size);
+        if (!data) { fprintf(stderr, "nao foi possivel ler %s\n", cart); return 1; }
+        coco_load_rom(m, COCO_ROM_CARTRIDGE, data, size);
+        coco_set_cartridge_autostart(m, !no_rom);
+        free(data);
     }
     for (i = 0; i < MEDIA_MAX_DRIVES; i++)
         if (disks[i]) media_disk_insert(&md, i, disks[i], 0);
     if (cas) media_tape_insert(&md, cas);
     coco_reset(m, 1);
+    if (load_state) {
+        size_t size;
+        uint8_t *data = media_read_file(load_state, &size);
+        int r = data ? coco_snapshot_load(m, data, size) : -1;
+        free(data);
+        if (r != COCO_SNAPSHOT_OK) {
+            fprintf(stderr, "falha ao carregar %s (codigo %d)\n", load_state, r);
+            return 1;
+        }
+    }
 
-    for (i = 0; i < boot_frames && i < frames; i++)
+    for (i = 0; i < boot_frames && i < frames; i++) {
         coco_run_frame(m);
+        sample_pc(m, samples, &nsamples);
+    }
 
     /* digita o texto: cada tecla fica 3 quadros pressionada e 3 solta */
     if (type) {
@@ -168,13 +276,27 @@ int main(int argc, char **argv)
         }
     }
 
-    for (; i < frames; i++)
+    for (; i < frames; i++) {
         coco_run_frame(m);
+        sample_pc(m, samples, &nsamples);
+    }
 
     coco_get_cpu_state(m, &st);
     printf("PC=%04X A=%02X B=%02X X=%04X Y=%04X U=%04X S=%04X DP=%02X CC=%02X ciclos=%llu\n",
            st.pc, st.a, st.b, st.x, st.y, st.u, st.s, st.dp, st.cc,
            (unsigned long long)st.cycles);
+
+    if (diag)
+        diag_report(m, samples, nsamples);
+
+    if (save_state) {
+        size_t size = coco_snapshot_size(m);
+        uint8_t *data = (uint8_t *)malloc(size);
+        if (!data || !coco_snapshot_save(m, data, size) ||
+            media_write_file(save_state, data, size) != 0)
+            fprintf(stderr, "falha ao gravar %s\n", save_state);
+        free(data);
+    }
 
     if (ppm && save_ppm(ppm, hl.last) != 0)
         fprintf(stderr, "falha ao gravar %s\n", ppm);

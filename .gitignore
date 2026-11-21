@@ -3,3 +3,6 @@ roms/*.rom
 roms/*.ROM
 *.o
 *.a
+__pycache__/
+*.pyc
+*.snap
